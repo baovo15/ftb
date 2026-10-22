@@ -97,8 +97,16 @@ const REDACTED_SECRET_VALUE: &str = "[REDACTED]";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(20);
 const VALIDATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-static INSTALL_CATALOG: LazyLock<Arc<Catalog>> =
-    LazyLock::new(|| Arc::new(fabro_llm::default_catalog()));
+// Built with the server's environment overrides, so the wizard validates a
+// key against the same gateway the server will call.
+static INSTALL_CATALOG: LazyLock<Arc<Catalog>> = LazyLock::new(|| {
+    Arc::new(
+        fabro_llm::build_catalog(&fabro_config::LlmLayer::default(), &|name| {
+            crate::interp::process_env_var(name)
+        })
+        .unwrap_or_else(|_| fabro_llm::default_catalog()),
+    )
+});
 
 impl InstallAppState {
     #[must_use]

@@ -91,6 +91,7 @@ impl EnvVars {
     pub const ANTHROPIC_API_KEY: &'static str = "ANTHROPIC_API_KEY";
     pub const AWS_BEARER_TOKEN_BEDROCK: &'static str = "AWS_BEARER_TOKEN_BEDROCK";
     pub const ANTHROPIC_BASE_URL: &'static str = "ANTHROPIC_BASE_URL";
+    pub const ANTHROPIC_MODEL: &'static str = "ANTHROPIC_MODEL";
     pub const BEDROCK_API_KEY: &'static str = "BEDROCK_API_KEY";
     pub const BRAVE_SEARCH_API_KEY: &'static str = "BRAVE_SEARCH_API_KEY";
     pub const VENICE_API_KEY: &'static str = "VENICE_API_KEY";
@@ -255,6 +256,7 @@ mod tests {
             EnvVars::DOCKER_CONTEXT,
             EnvVars::ANTHROPIC_API_KEY,
             EnvVars::ANTHROPIC_BASE_URL,
+            EnvVars::ANTHROPIC_MODEL,
             EnvVars::AWS_BEARER_TOKEN_BEDROCK,
             EnvVars::BEDROCK_API_KEY,
             EnvVars::BRAVE_SEARCH_API_KEY,

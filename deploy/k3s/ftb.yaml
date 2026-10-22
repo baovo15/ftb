@@ -82,6 +82,14 @@ spec:
             secretKeyRef:
               name: ftb-env
               key: SESSION_SECRET
+        # Anthropic through the in-cluster 9router gateway (allow-ftb egress
+        # already permits it); the public 9router.nhaboc.com name resolves to
+        # the tailnet IP, which the egress rule blocks. The key itself goes in
+        # Fabro's vault via the install wizard (ANTHROPIC_API_KEY).
+        - name: ANTHROPIC_BASE_URL
+          value: http://ninerouter.tieudidi-prod.svc.cluster.local:20128
+        - name: ANTHROPIC_MODEL
+          value: cc/claude-haiku-5-5
         ports:
         - name: http
           containerPort: 32276
