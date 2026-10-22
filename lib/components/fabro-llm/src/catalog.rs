@@ -23,9 +23,12 @@ const AGENT_METADATA_NAMESPACE: &str = "agent";
 
 /// Builds the effective catalog.
 ///
-/// `env_lookup` supplies `OPENAI_BASE_URL`, the one environment override
-/// Fabro honors: it repoints the `openai` provider so test doubles and
-/// gateways can stand in for the real API without editing settings.
+/// `env_lookup` supplies the environment overrides Fabro honors, so test
+/// doubles and gateways can stand in for the real APIs without editing
+/// settings: `OPENAI_BASE_URL` repoints the `openai` provider, and
+/// `ANTHROPIC_BASE_URL` the `anthropic` one. `ANTHROPIC_MODEL` adds that wire
+/// model to `anthropic` as its default, small-default and probe model, for a
+/// gateway that serves its own model names.
 pub fn build_catalog(
     overlay: &LlmLayer,
     env_lookup: &dyn Fn(&str) -> Option<String>,
@@ -36,12 +39,8 @@ pub fn build_catalog(
         document.insert_str(0, "schema_version = 1\n");
         builder = builder.toml_layer("settings [llm]", &document)?;
     }
-    if let Some(base_url) = env_lookup(EnvVars::OPENAI_BASE_URL) {
-        let document = format!(
-            "schema_version = 1\n[providers.openai]\nbase_url = {}\n",
-            toml::Value::String(base_url.trim_end_matches("/v1").to_string())
-        );
-        builder = builder.toml_layer("OPENAI_BASE_URL", &document)?;
+    for (name, document) in env_layers(env_lookup) {
+        builder = builder.toml_layer(name, &document)?;
     }
     let catalog = builder.build()?;
     // The coding agent reads a provider's harness profile from
@@ -58,17 +57,75 @@ pub fn build_catalog(
         document.insert_str(0, "schema_version = 1\n");
         builder = builder.toml_layer("settings [llm]", &document)?;
     }
-    if let Some(base_url) = env_lookup(EnvVars::OPENAI_BASE_URL) {
-        let document = format!(
-            "schema_version = 1\n[providers.openai]\nbase_url = {}\n",
-            toml::Value::String(base_url.trim_end_matches("/v1").to_string())
-        );
-        builder = builder.toml_layer("OPENAI_BASE_URL", &document)?;
+    for (name, document) in env_layers(env_lookup) {
+        builder = builder.toml_layer(name, &document)?;
     }
     builder
         .toml_layer("implied agent profiles", &implied)
         .and_then(CatalogBuilder::build)
 }
+
+/// The catalog layers the environment overrides imply, in application order.
+fn env_layers(env_lookup: &dyn Fn(&str) -> Option<String>) -> Vec<(&'static str, String)> {
+    let mut layers = Vec::new();
+    for (name, provider) in [
+        (EnvVars::OPENAI_BASE_URL, "openai"),
+        (EnvVars::ANTHROPIC_BASE_URL, "anthropic"),
+    ] {
+        if let Some(base_url) = env_lookup(name).filter(|value| !value.trim().is_empty()) {
+            layers.push((
+                name,
+                format!(
+                    "schema_version = 1\n[providers.{provider}]\nbase_url = {}\n",
+                    toml::Value::String(base_url.trim().trim_end_matches('/').trim_end_matches("/v1").to_string())
+                ),
+            ));
+        }
+    }
+    if let Some(api_model) = env_lookup(EnvVars::ANTHROPIC_MODEL)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        layers.push((EnvVars::ANTHROPIC_MODEL, anthropic_model_layer(&api_model)));
+    }
+    layers
+}
+
+/// Adds `api_model` to the `anthropic` provider as its default, small-default
+/// and probe model, taking those roles from the built-in rows. The catalog id
+/// is the part after the last `/`, so a gateway route like
+/// `cc/claude-haiku-5-5` never reads as a `provider/model` selector.
+fn anthropic_model_layer(api_model: &str) -> String {
+    use std::fmt::Write as _;
+
+    let id = api_model.rsplit('/').next().unwrap_or(api_model);
+    let quoted_id = toml::Value::String(id.to_string());
+    let mut document = format!(
+        "schema_version = 1\n[providers.anthropic]\ndefault_model = {quoted_id}\n\n"
+    );
+    for builtin in BUILTIN_ANTHROPIC_ROLE_MODELS {
+        if *builtin != id {
+            let _ = writeln!(
+                document,
+                "[providers.anthropic.models.{}]\nsmall_default = false\nprobe = false\n",
+                toml::Value::String((*builtin).to_string())
+            );
+        }
+    }
+    let _ = writeln!(
+        document,
+        "[providers.anthropic.models.{quoted_id}]\ndisplay_name = {quoted_id}\napi_model = {}\n\
+         limits = {{ context_tokens = 200000, max_output_tokens = 64000 }}\n\
+         capabilities = {{ text = true, images = true, documents = true, tools = true, caching = true }}\n\
+         small_default = true\nprobe = true",
+        toml::Value::String(api_model.to_string())
+    );
+    document
+}
+
+/// The built-in `anthropic` rows that hold the `small_default` or `probe`
+/// role, which an `ANTHROPIC_MODEL` override takes over.
+const BUILTIN_ANTHROPIC_ROLE_MODELS: &[&str] = &["claude-haiku-4.5"];
 
 /// A TOML layer declaring `metadata.agent.profile` for every provider that
 /// has none, as the profile implied by the provider's adapter. Empty when
@@ -228,6 +285,42 @@ enabled = false
             catalog.provider("openai").unwrap().base_url(),
             "http://127.0.0.1:1234"
         );
+    }
+
+    #[test]
+    fn anthropic_env_repoints_the_provider_and_sets_its_model() {
+        let catalog = build_catalog(&LlmLayer::default(), &|name| match name {
+            EnvVars::ANTHROPIC_BASE_URL => Some("http://gateway.test:20128/".to_string()),
+            EnvVars::ANTHROPIC_MODEL => Some("cc/claude-haiku-5-5".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        let anthropic = catalog.enabled_provider("anthropic").unwrap();
+        assert_eq!(anthropic.base_url(), "http://gateway.test:20128");
+        let default = anthropic.default_offering().unwrap();
+        assert_eq!(default.model.id().as_str(), "claude-haiku-5-5");
+        assert_eq!(default.model.api_model(), "cc/claude-haiku-5-5");
+        assert_eq!(
+            anthropic.probe_offering().unwrap().model.id().as_str(),
+            "claude-haiku-5-5"
+        );
+        assert!(!anthropic.model("claude-haiku-4.5").unwrap().is_probe());
+        assert_eq!(
+            agent_profile(&catalog, "anthropic", Some("claude-haiku-5-5")),
+            Some(AgentProfileKind::Anthropic)
+        );
+    }
+
+    #[test]
+    fn blank_anthropic_env_changes_nothing() {
+        let catalog = build_catalog(&LlmLayer::default(), &|name| match name {
+            EnvVars::ANTHROPIC_BASE_URL | EnvVars::ANTHROPIC_MODEL => Some("  ".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        let anthropic = catalog.enabled_provider("anthropic").unwrap();
+        assert_eq!(anthropic.base_url(), "https://api.anthropic.com");
+        assert!(anthropic.model("claude-haiku-4.5").unwrap().is_probe());
     }
 
     #[test]

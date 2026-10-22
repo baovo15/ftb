@@ -64,6 +64,12 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
     EnvVars::DOCKER_API_VERSION,
     EnvVars::DOCKER_CONFIG,
     EnvVars::DOCKER_CONTEXT,
+    // The LLM gateway overrides the worker's catalog applies
+    // (fabro_llm::build_catalog): endpoints and a model name only. The
+    // provider key stays in the vault.
+    EnvVars::OPENAI_BASE_URL,
+    EnvVars::ANTHROPIC_BASE_URL,
+    EnvVars::ANTHROPIC_MODEL,
     // Daytona's non-secret selection. The worker reads the API key from
     // the vault and supplies it explicitly to the in-process provider.
     EnvVars::DAYTONA_API_URL,
