@@ -51,6 +51,30 @@ spec:
     targetPort: http
     nodePort: 30882
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ftb-ninerouter-proxy
+  namespace: ftb
+data:
+  default.conf: |
+    resolver kube-dns.kube-system.svc.cluster.local valid=30s ipv6=off;
+    server {
+        listen 127.0.0.1:20128;
+        client_max_body_size 64m;
+        location / {
+            set $upstream http://ninerouter.tieudidi-prod.svc.cluster.local:20128;
+            proxy_pass $upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            # SSE token streaming; don't buffer.
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+        }
+    }
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -82,12 +106,14 @@ spec:
             secretKeyRef:
               name: ftb-env
               key: SESSION_SECRET
-        # Anthropic through the in-cluster 9router gateway (allow-ftb egress
-        # already permits it); the public 9router.nhaboc.com name resolves to
-        # the tailnet IP, which the egress rule blocks. The key itself goes in
-        # Fabro's vault via the install wizard (ANTHROPIC_API_KEY).
+        # Anthropic through 9router via the ninerouter-proxy sidecar below.
+        # lithos refuses to send a key over plain HTTP except to loopback, and
+        # the in-cluster 9router Service is plain HTTP; the public
+        # 9router.nhaboc.com resolves to the tailnet IP, which allow-ftb's
+        # egress blocks. The key itself goes in Fabro's vault via the install
+        # wizard (ANTHROPIC_API_KEY).
         - name: ANTHROPIC_BASE_URL
-          value: http://ninerouter.tieudidi-prod.svc.cluster.local:20128
+          value: http://127.0.0.1:20128
         - name: ANTHROPIC_MODEL
           value: cc/claude-haiku-5-5
         ports:
@@ -121,7 +147,32 @@ spec:
           mountPath: /storage
         - name: docker-sock
           mountPath: /var/run/docker.sock
+      # Loopback-only forwarder to the in-cluster 9router Service (see
+      # ANTHROPIC_BASE_URL above). Same pod, so allow-ftb's ninerouter egress
+      # rule covers it; it listens on 127.0.0.1 only.
+      - name: ninerouter-proxy
+        image: nginx:1.27-alpine
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        readinessProbe:
+          tcpSocket:
+            host: 127.0.0.1
+            port: 20128
+          periodSeconds: 15
+        volumeMounts:
+        - name: ninerouter-proxy-conf
+          mountPath: /etc/nginx/conf.d
+          readOnly: true
       volumes:
+      - name: ninerouter-proxy-conf
+        configMap:
+          name: ftb-ninerouter-proxy
       - name: docker-sock
         hostPath:
           path: /var/run/docker.sock
