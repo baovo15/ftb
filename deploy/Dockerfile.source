@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.9
+#
+# ftb: build the Fabro server image from source.
+#
+# Upstream's Dockerfile expects release-built musl binaries in
+# tmp/docker-context/<arch>/fabro. This builds the same thing in-image
+# (mirroring `cargo dev docker-build` and .github/workflows/release.yml),
+# then runs it on upstream's runtime base. Build from the repo root:
+#   docker build -f deploy/Dockerfile.source --build-arg GIT_SHA=$(git rev-parse --short HEAD) .
+# Uses deploy/Dockerfile.source.dockerignore, not the root .dockerignore.
+
+ARG RUST_VERSION=1.97.1
+ARG BUN_VERSION=1.3.14
+ARG ZIG_VERSION=0.13.0
+
+FROM --platform=$BUILDPLATFORM oven/bun:${BUN_VERSION} AS spa
+WORKDIR /src
+COPY . .
+RUN bun install --frozen-lockfile \
+ && cd apps/fabro-web && bun run build
+
+# Runs on the build host and cross-compiles with zig, so an amd64 image builds
+# at native speed on an arm64 machine too.
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS build
+ARG ZIG_VERSION
+ARG BUILDARCH
+ARG TARGETARCH
+ARG GIT_SHA=
+RUN apt-get update -qq \
+ && apt-get install -y -qq pkg-config perl make cmake xz-utils curl git >/dev/null \
+ && case "$BUILDARCH" in amd64) za=x86_64 ;; arm64) za=aarch64 ;; *) exit 1 ;; esac \
+ && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${za}-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt \
+ && ln -s "/opt/zig-linux-${za}-${ZIG_VERSION}/zig" /usr/local/bin/zig \
+ && cargo install --locked cargo-zigbuild
+WORKDIR /src
+COPY . .
+# Embedded SPA: same mirror `cargo dev spa refresh` does after `bun run build`.
+COPY --from=spa /src/apps/fabro-web/dist/ lib/apps/fabro-spa/assets/
+ENV LIBZ_SYS_STATIC=1
+# build.rs reads the sha from git; there is no .git in the context, so give it one commit.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/target,id=ftb-target-${TARGETARCH} \
+    case "$TARGETARCH" in amd64) t=x86_64-unknown-linux-musl ;; arm64) t=aarch64-unknown-linux-musl ;; esac \
+ && if [ -n "$GIT_SHA" ]; then git init -q && git -c user.name=ftb -c user.email=ftb@localhost commit -q --allow-empty -m "$GIT_SHA"; fi \
+ && rustup target add "$t" \
+ && CARGO_TARGET_DIR=/target cargo zigbuild --locked --release -p fabro-cli --target "$t" \
+ && install -D -m 0755 "/target/$t/release/fabro" /out/fabro
+
+FROM ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-04-18
+
+USER root
+
+RUN apk add --no-cache \
+      ca-certificates \
+      git \
+      su-exec \
+      tini \
+ && addgroup -S -g 1000 fabro \
+ && adduser -S -u 1000 -G fabro -h /var/fabro -s /sbin/nologin fabro \
+ && install -d -o fabro -g fabro -m 0755 /var/fabro /storage
+
+COPY --from=build --chmod=0755 /out/fabro /usr/local/bin/fabro
+
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/fabro-entrypoint
+
+ENV FABRO_HOME=/storage/.home \
+    FABRO_STORAGE_DIR=/storage \
+    FABRO_LOG_DESTINATION=stdout
+
+VOLUME ["/storage"]
+EXPOSE 32276
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/fabro-entrypoint"]
+CMD ["sh", "-c", "exec fabro server start --foreground --bind 0.0.0.0:${PORT:-32276}"]

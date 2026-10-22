@@ -1,0 +1,184 @@
+# ftb (fork of Fabro) on k3s: namespace ftb, ftb.nhaboc.com -> NodePort 30882.
+# One replica that owns /storage (host /var/lib/ftb on beboc). IMAGE_TAG is set
+# by scripts/ftb-deploy.sh. The Secret ftb-env (SESSION_SECRET) is created by
+# that script; provider keys go in Fabro's vault via the install wizard.
+#
+# Mounts the host's /var/run/docker.sock (as upstream's compose file does) so
+# Fabro can start Docker sandboxes on beboc's Docker daemon. That is
+# host-root-equivalent access for this pod: trusted, single-tenant use only.
+# Sandbox containers run outside k3s, so these NetworkPolicies do not cover them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ftb
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ftb-data
+  labels:
+    app: ftb
+spec:
+  accessModes: [ReadWriteOnce]
+  capacity:
+    storage: 50Gi
+  local:
+    path: /var/lib/ftb
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values: [beboc]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ftb-local
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ftb
+  namespace: ftb
+  labels:
+    app: ftb
+spec:
+  type: NodePort
+  selector:
+    app: ftb
+  ports:
+  - name: http
+    port: 32276
+    targetPort: http
+    nodePort: 30882
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ftb
+  namespace: ftb
+  labels:
+    app: ftb
+spec:
+  replicas: 1
+  serviceName: ftb
+  selector:
+    matchLabels:
+      app: ftb
+  template:
+    metadata:
+      labels:
+        app: ftb
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: ftb
+        image: 127.0.0.1:30082/ftb:IMAGE_TAG
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: FABRO_WEB_URL
+          value: https://ftb.nhaboc.com
+        - name: SESSION_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: ftb-env
+              key: SESSION_SECRET
+        ports:
+        - name: http
+          containerPort: 32276
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 10
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 15
+          timeoutSeconds: 5
+        livenessProbe:
+          tcpSocket:
+            port: http
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: "8"
+            memory: 8Gi
+        volumeMounts:
+        - name: data
+          mountPath: /storage
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+      volumes:
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: ftb-local
+      resources:
+        requests:
+          storage: 50Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ftb
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: ftb
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - {port: 53, protocol: UDP}
+    - {port: 53, protocol: TCP}
+---
+# Same shape as gastown's allow-gastown: web in, ninerouter and public internet out.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ftb
+  namespace: ftb
+spec:
+  podSelector:
+    matchLabels:
+      app: ftb
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - ports:
+    - {port: 32276, protocol: TCP}
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: tieudidi-prod
+      podSelector:
+        matchLabels:
+          app: ninerouter
+    ports:
+    - {port: 20128, protocol: TCP}
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, 100.64.0.0/10]
